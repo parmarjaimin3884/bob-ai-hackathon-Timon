@@ -372,14 +372,35 @@ async def upload_and_ingest_alerts(
         except Exception as pipe_err:
             logger.warning(f"Correlation pipeline post-ingest warning: {pipe_err}")
 
-        # Clear cached aggregations for this user so all pages receive fresh ingested telemetry
-        try:
-            from services.cache_service import cache
-            cache.delete(f"dashboard_stats_{current_user.id}")
-            cache.delete(f"analytics_overview_{current_user.id}")
-            cache.delete(f"all_attack_chains_{current_user.id}")
-        except Exception:
-            pass
+        # Start background cache pre-warming so the dashboard loads instantly
+        def _bg_prewarm_cache(uid):
+            try:
+                from database.session import SessionLocal
+                from routers.dashboard import get_dashboard_stats, get_analytics_overview
+                from routers.correlation import get_attack_chains
+                from services.cache_service import cache
+                
+                class DummyUser:
+                    id = uid
+                    
+                user_obj = DummyUser()
+                with SessionLocal() as db_session:
+                    # Clear out the old cached data
+                    cache.delete(f"dashboard_stats_{uid}")
+                    cache.delete(f"analytics_overview_{uid}")
+                    cache.delete(f"all_attack_chains_{uid}")
+                    
+                    # Re-execute heavy aggregations in the background to pre-warm the cache
+                    get_dashboard_stats(current_user=user_obj, db=db_session)
+                    get_analytics_overview(current_user=user_obj, db=db_session)
+                    get_attack_chains(current_user=user_obj, db=db_session)
+            except Exception as e:
+                logger.warning(f"Cache pre-warm failed for {uid}: {e}")
+
+        if background_tasks:
+            background_tasks.add_task(_bg_prewarm_cache, current_user.id)
+        else:
+            _bg_prewarm_cache(current_user.id)
 
         return JSONResponse(
             status_code=status.HTTP_201_CREATED,
